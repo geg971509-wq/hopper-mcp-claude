@@ -8,8 +8,9 @@ Claude Code  --streamable HTTP-->  this bridge  --stdio/NDJSON-->  HopperMCPServ
 
 Hopper ships an MCP server (`HopperMCPServer`) that speaks a newline-delimited
 JSON protocol over stdio. This bridge runs a small local HTTP MCP server, forwards
-`tools/list` and `tools/call` to Hopper, and registers itself with Claude Code as
-an HTTP MCP server. A launchd agent keeps it running across logins.
+`tools/list`/`tools/call` (and, transparently, `prompts`/`resources` when Hopper
+offers them), and registers itself with Claude Code as an HTTP MCP server. A launchd
+agent keeps it running across logins.
 
 ## When you actually need this
 
@@ -27,9 +28,10 @@ shared across projects.
 ## Requirements
 
 - macOS
-- Hopper with the bundled `HopperMCPServer` at
-  `/Applications/Hopper Disassembler.app/Contents/MacOS/HopperMCPServer`
-  (override with `--hopper-path` or `HOPPER_MCP_SERVER_PATH`)
+- **Hopper 6.0 or newer.** The bundled `HopperMCPServer` binary only ships with
+  Hopper 6+ — Hopper 4 and 5 have no MCP server and cannot be bridged. The bridge
+  auto-detects the binary across common bundle names/locations; override with
+  `--hopper-path` or `HOPPER_MCP_SERVER_PATH` if yours lives elsewhere.
 - Claude Code
 - Python 3.10+
 
@@ -47,30 +49,51 @@ Then restart Claude Code so it re-reads its config.
 
 `install` does two things:
 
-1. Adds this block to `~/.claude.json` under `mcpServers` (atomically, leaving the
-   rest of the file untouched):
+1. Adds this block to `~/.claude.json` under `mcpServers` (atomically, under an
+   advisory lock, leaving the rest of the file untouched):
 
    ```json
-   "hopper": { "type": "http", "url": "http://127.0.0.1:8765/mcp/" }
+   "hopper": {
+     "type": "http",
+     "url": "http://127.0.0.1:8765/mcp/",
+     "timeout": 300000
+   }
    ```
 
+   The `timeout` (milliseconds) matters: Claude Code's default per-tool timeout is
+   ~60s, and reverse-engineering calls (decompiling a large function, analyzing a big
+   Mach-O) routinely exceed that. Tune it with `--tool-timeout-sec` (default 300).
+
 2. Writes and loads a launchd agent at
-   `~/Library/LaunchAgents/io.github.hopper-claude-mcp-http-bridge.plist`.
+   `~/Library/LaunchAgents/io.github.hopper-claude-mcp-http-bridge.plist`. The agent
+   bakes in the resolved Hopper path and the tool timeout.
 
 Because Claude Code also writes to `~/.claude.json`, run `install` while Claude
-Code is closed, then start it again.
+Code is closed, then start it again. (The advisory lock only guards against other
+bridge processes — Claude Code itself does not take it.)
 
-Note: the default server name is `hopper`. If you already have a `hopper` entry
-(for example a different Hopper MCP server), `install` replaces it. Use
-`--server-name hopper-bridge` to keep both.
+If Claude Code ignores the per-server `timeout` in your build (there are open bugs
+around HTTP/SSE timeout handling), set a global fallback in `~/.claude/settings.json`:
+
+```json
+{ "env": { "MCP_TOOL_TIMEOUT": "300000" } }
+```
+
+Note: the default server name is `hopper`. If you already have a `hopper` entry,
+`install` replaces it. Use `--server-name hopper-bridge` to keep both.
 
 ## Verify
 
 ```bash
-curl http://127.0.0.1:8765/healthz          # -> ok
-hopper-claude-mcp-http-bridge status
+curl http://127.0.0.1:8765/healthz          # -> ok           (bridge process alive)
+curl http://127.0.0.1:8765/readyz           # -> JSON: backend state + Hopper path
+hopper-claude-mcp-http-bridge status        # url, timeout, bridge_health, backend
 claude mcp list                             # hopper should be listed as http
 ```
+
+`status` reports `bridge_health` (is the HTTP bridge up) separately from `backend`
+(is the Hopper subprocess running / is the binary present). A `backend:
+missing-hopper-binary` line means you need Hopper 6+.
 
 ## Commands
 
@@ -81,23 +104,39 @@ hopper-claude-mcp-http-bridge uninstall   # remove agent, unregister
 hopper-claude-mcp-http-bridge status      # url + agent + health
 ```
 
-Useful options: `--port 9876`, `--server-name hopper-bridge`, `--no-load-agent`
-(write files only), `uninstall --keep-config` (drop the agent, keep the entry).
+Useful options: `--port 9876`, `--server-name hopper-bridge`, `--tool-timeout-sec 600`,
+`--hopper-path /path/to/HopperMCPServer`, `--no-load-agent` (write files only),
+`uninstall --keep-config` (drop the agent, keep the entry).
 
 ## Logs
 
 ```
-~/.claude/logs/hopper-mcp-http-bridge.log
+~/.claude/logs/hopper-mcp-http-bridge.log            # bridge + captured Hopper stderr
 ~/.claude/logs/hopper-mcp-http-bridge.log.stdout.log
 ~/.claude/logs/hopper-mcp-http-bridge.log.stderr.log
 ```
 
 ## Notes
 
-- The bridge forwards Hopper's tools and keeps prompts and resources empty.
-- It reads one JSON line per request from Hopper. If a Hopper build interleaves
-  unsolicited notifications during a call, the read would desync; this has not been
-  a problem in practice but is worth knowing.
+- The bridge forwards Hopper's tools, and forwards prompts/resources transparently
+  when Hopper is already running and implements them (it will not start Hopper just
+  to answer a startup `prompts/list`).
+- A dedicated reader thread parses Hopper's output, so a request waits for its own
+  id and skips interleaved notifications instead of mistaking one for the response.
+  Each call is bounded by the tool timeout; a wedged Hopper call is terminated and
+  restarted rather than pinning the bridge.
+
+### On the `mcp` dependency pin
+
+`mcp` is pinned to `>=1.27,<2` on purpose. This bridge is built on the **low-level
+`mcp.server.lowlevel.Server` API** and its decorators (`@server.list_tools()`,
+`@server.call_tool()`, `@server.list_prompts()`, `@server.list_resources()`).
+
+That API changed in **mcp 2.0**: those decorators were removed/reworked, so an
+unpinned `mcp>=1.27.0` install now resolves to 2.x and the bridge fails at startup
+with `AttributeError: 'Server' object has no attribute 'list_prompts'`. The upper
+bound keeps installs on the 1.x line the code targets. Moving to mcp 2.x is a
+separate migration (adapt the low-level handlers to the new API), not a version bump.
 
 ## License
 

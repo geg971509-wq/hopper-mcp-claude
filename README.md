@@ -62,7 +62,9 @@ Not the product, just what supports the work:
 ## Requirements
 
 - macOS
-- Hopper with the bundled `HopperMCPServer` (for the bridge)
+- Hopper **6.0+** with the bundled `HopperMCPServer` (for the bridge). The MCP
+  server ships only with Hopper 6+; Hopper 4/5 have none. The bridge auto-detects
+  the binary and errors clearly if it is missing.
 - IDA Pro with `idat` (for `references/open_ipa.sh`)
 - Claude Code, Python 3.10+
 

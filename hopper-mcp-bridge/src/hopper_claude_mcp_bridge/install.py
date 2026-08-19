@@ -1,19 +1,21 @@
 """Wire the running HTTP bridge into Claude Code and macOS launchd.
 
 Claude Code keeps its MCP servers in ``~/.claude.json`` under the top-level
-``mcpServers`` object, as ``{"type": "http", "url": "..."}``. We edit that file
-atomically so the rest of Claude Code's state is preserved untouched. A launchd
-agent keeps the bridge itself running across logins.
+``mcpServers`` object, as ``{"type": "http", "url": "...", "timeout": <ms>}``. We edit
+that file atomically (and under an advisory lock) so the rest of Claude Code's state is
+preserved untouched. A launchd agent keeps the bridge itself running across logins.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +24,8 @@ from .bridge import (
     DEFAULT_LOG_PATH,
     DEFAULT_MOUNT_PATH,
     DEFAULT_PORT,
+    DEFAULT_TOOL_TIMEOUT_SEC,
+    find_hopper_server,
 )
 
 
@@ -47,6 +51,8 @@ class InstallSettings:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     mount_path: str = DEFAULT_MOUNT_PATH
+    tool_timeout_sec: int = DEFAULT_TOOL_TIMEOUT_SEC
+    hopper_server_path: str | None = None
     claude_config_path: Path = Path("~/.claude.json").expanduser()
     launch_agent_path: Path = Path(
         f"~/Library/LaunchAgents/{DEFAULT_LABEL}.plist"
@@ -62,15 +68,39 @@ class InstallSettings:
             self, "launch_agent_path", self.launch_agent_path.expanduser()
         )
         object.__setattr__(self, "log_path", self.log_path.expanduser())
+        object.__setattr__(
+            self, "hopper_server_path", find_hopper_server(self.hopper_server_path)
+        )
 
     @property
     def url(self) -> str:
         return _mcp_url(self.host, self.port, self.mount_path)
 
+    @property
+    def tool_timeout_ms(self) -> int:
+        return self.tool_timeout_sec * 1000
+
 
 # --------------------------------------------------------------------------- #
-# ~/.claude.json editing (atomic, non-destructive)
+# ~/.claude.json editing (atomic, non-destructive, advisory-locked)
 # --------------------------------------------------------------------------- #
+@contextmanager
+def _config_lock(path: Path):
+    """Serialize concurrent bridge edits of the config via an advisory lock file.
+
+    Note: this only guards against other bridge processes. Claude Code itself does not
+    take this lock, so run ``install``/``uninstall`` while Claude Code is closed.
+    """
+    lock_path = path.with_name(path.name + ".hopper-bridge.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def _load_claude_config(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -89,12 +119,12 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _set_server_entry(data: dict, name: str, url: str) -> None:
+def _set_server_entry(data: dict, name: str, url: str, timeout_ms: int) -> None:
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
         data["mcpServers"] = servers
-    servers[name] = {"type": "http", "url": url}
+    servers[name] = {"type": "http", "url": url, "timeout": timeout_ms}
 
 
 def _remove_server_entry(data: dict, name: str) -> bool:
@@ -127,6 +157,10 @@ def _launch_agent_plist(settings: InstallSettings) -> str:
         <string>{settings.port}</string>
         <string>--path</string>
         <string>{_normalize_mount_path(settings.mount_path)}</string>
+        <string>--hopper-path</string>
+        <string>{settings.hopper_server_path}</string>
+        <string>--tool-timeout-sec</string>
+        <string>{settings.tool_timeout_sec}</string>
         <string>--log-path</string>
         <string>{settings.log_path}</string>
     </array>
@@ -134,6 +168,10 @@ def _launch_agent_plist(settings: InstallSettings) -> str:
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>WorkingDirectory</key>
     <string>{Path.home()}</string>
     <key>StandardOutPath</key>
@@ -161,13 +199,26 @@ def _user_uid() -> int:
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
-def install(settings: InstallSettings, *, load_agent: bool = True) -> None:
+def install(settings: InstallSettings, *, load_agent: bool = True) -> list[str]:
+    """Install the bridge. Returns a list of human-readable warnings (may be empty)."""
+    warnings: list[str] = []
+    if not os.path.exists(settings.hopper_server_path or ""):
+        warnings.append(
+            f"HopperMCPServer not found at {settings.hopper_server_path}. The MCP server "
+            "requires Hopper 6.0+ (Hopper 4/5 ship none). The bridge is installed but "
+            "tool calls will fail until a compatible Hopper is present. Override with "
+            "--hopper-path once installed."
+        )
+
     settings.log_path.parent.mkdir(parents=True, exist_ok=True)
     settings.launch_agent_path.parent.mkdir(parents=True, exist_ok=True)
 
-    data = _load_claude_config(settings.claude_config_path)
-    _set_server_entry(data, settings.server_name, settings.url)
-    _atomic_write_json(settings.claude_config_path, data)
+    with _config_lock(settings.claude_config_path):
+        data = _load_claude_config(settings.claude_config_path)
+        _set_server_entry(
+            data, settings.server_name, settings.url, settings.tool_timeout_ms
+        )
+        _atomic_write_json(settings.claude_config_path, data)
 
     settings.launch_agent_path.write_text(
         _launch_agent_plist(settings),
@@ -192,6 +243,8 @@ def install(settings: InstallSettings, *, load_agent: bool = True) -> None:
         if kickstart.returncode != 0:
             raise RuntimeError(kickstart.stderr.strip() or kickstart.stdout.strip())
 
+    return warnings
+
 
 def uninstall(
     settings: InstallSettings,
@@ -207,19 +260,34 @@ def uninstall(
         settings.launch_agent_path.unlink()
 
     if remove_config and settings.claude_config_path.exists():
-        data = _load_claude_config(settings.claude_config_path)
-        if _remove_server_entry(data, settings.server_name):
-            _atomic_write_json(settings.claude_config_path, data)
+        with _config_lock(settings.claude_config_path):
+            data = _load_claude_config(settings.claude_config_path)
+            if _remove_server_entry(data, settings.server_name):
+                _atomic_write_json(settings.claude_config_path, data)
 
 
 def status(settings: InstallSettings) -> dict[str, str]:
-    health_url = f"http://{settings.host}:{settings.port}/healthz"
-    health = "down"
+    base = f"http://{settings.host}:{settings.port}"
+
+    bridge_health = "down"
     try:
-        with urllib.request.urlopen(health_url, timeout=2) as response:
+        with urllib.request.urlopen(f"{base}/healthz", timeout=2) as response:
             if response.read().decode("utf-8").strip() == "ok":
-                health = "up"
+                bridge_health = "up"
     except (OSError, urllib.error.URLError):
+        pass
+
+    backend = "unknown"
+    hopper_server = settings.hopper_server_path or "?"
+    try:
+        with urllib.request.urlopen(f"{base}/readyz", timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            hopper_server = payload.get("server_path", hopper_server)
+            if not payload.get("server_path_exists", True):
+                backend = "missing-hopper-binary (needs Hopper 6+)"
+            else:
+                backend = payload.get("backend", "unknown")
+    except (OSError, urllib.error.URLError, ValueError):
         pass
 
     registered = "no"
@@ -227,7 +295,9 @@ def status(settings: InstallSettings) -> dict[str, str]:
         data = _load_claude_config(settings.claude_config_path)
         entry = data.get("mcpServers", {}).get(settings.server_name)
         if isinstance(entry, dict) and entry.get("url"):
-            registered = "yes" if entry["url"] == settings.url else f"other:{entry['url']}"
+            registered = (
+                "yes" if entry["url"] == settings.url else f"other:{entry['url']}"
+            )
     except (OSError, ValueError):
         registered = "unknown"
 
@@ -236,5 +306,8 @@ def status(settings: InstallSettings) -> dict[str, str]:
         "registered": registered,
         "launch_agent": str(settings.launch_agent_path),
         "mcp_url": settings.url,
-        "health": health,
+        "tool_timeout_sec": str(settings.tool_timeout_sec),
+        "hopper_server": hopper_server,
+        "bridge_health": bridge_health,
+        "backend": backend,
     }

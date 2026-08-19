@@ -9,7 +9,9 @@ from .bridge import (
     DEFAULT_LOG_PATH,
     DEFAULT_MOUNT_PATH,
     DEFAULT_PORT,
+    DEFAULT_TOOL_TIMEOUT_SEC,
     BridgeSettings,
+    find_hopper_server,
     serve,
 )
 from .install import (
@@ -39,7 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--path", default=DEFAULT_MOUNT_PATH)
     serve_parser.add_argument(
         "--hopper-path",
-        default="/Applications/Hopper Disassembler.app/Contents/MacOS/HopperMCPServer",
+        default=None,
+        help="Path to HopperMCPServer. Default: auto-detect installed Hopper 6+.",
+    )
+    serve_parser.add_argument(
+        "--tool-timeout-sec",
+        type=int,
+        default=DEFAULT_TOOL_TIMEOUT_SEC,
+        help="Backend read timeout for a single tool call (seconds).",
     )
     serve_parser.add_argument("--log-path", type=_path, default=DEFAULT_LOG_PATH)
 
@@ -52,6 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--host", default=DEFAULT_HOST)
     install_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     install_parser.add_argument("--path", default=DEFAULT_MOUNT_PATH)
+    install_parser.add_argument(
+        "--hopper-path",
+        default=None,
+        help="Path to HopperMCPServer. Default: auto-detect installed Hopper 6+.",
+    )
+    install_parser.add_argument(
+        "--tool-timeout-sec",
+        type=int,
+        default=DEFAULT_TOOL_TIMEOUT_SEC,
+        help="Per-tool timeout written to Claude Code config and used by the bridge.",
+    )
     install_parser.add_argument(
         "--claude-config",
         type=_path,
@@ -106,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--host", default=DEFAULT_HOST)
     status_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     status_parser.add_argument("--path", default=DEFAULT_MOUNT_PATH)
+    status_parser.add_argument("--hopper-path", default=None)
+    status_parser.add_argument(
+        "--tool-timeout-sec", type=int, default=DEFAULT_TOOL_TIMEOUT_SEC
+    )
     status_parser.add_argument(
         "--claude-config",
         type=_path,
@@ -128,6 +152,8 @@ def _install_settings(args: argparse.Namespace) -> InstallSettings:
         host=getattr(args, "host", DEFAULT_HOST),
         port=getattr(args, "port", DEFAULT_PORT),
         mount_path=getattr(args, "path", DEFAULT_MOUNT_PATH),
+        tool_timeout_sec=getattr(args, "tool_timeout_sec", DEFAULT_TOOL_TIMEOUT_SEC),
+        hopper_server_path=getattr(args, "hopper_path", None),
         claude_config_path=args.claude_config,
         launch_agent_path=args.launch_agent,
         log_path=args.log_path,
@@ -144,7 +170,8 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 port=args.port,
                 mount_path=args.path,
-                hopper_server_path=args.hopper_path,
+                hopper_server_path=find_hopper_server(args.hopper_path),
+                tool_timeout_sec=args.tool_timeout_sec,
                 log_path=args.log_path,
             )
         )
@@ -152,10 +179,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "install":
         settings = _install_settings(args)
-        install(settings, load_agent=not args.no_load_agent)
+        warnings = install(settings, load_agent=not args.no_load_agent)
         print(f"Installed Hopper bridge at {settings.url}")
         print(f"Registered '{settings.server_name}' in {settings.claude_config_path}")
+        print(f"Hopper server: {settings.hopper_server_path}")
+        print(f"Per-tool timeout: {settings.tool_timeout_sec}s")
         print(f"LaunchAgent: {settings.launch_agent_path}")
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
         print("Restart Claude Code to pick up the new MCP server.")
         return 0
 
