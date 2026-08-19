@@ -12,6 +12,38 @@ JSON protocol over stdio. This bridge runs a small local HTTP MCP server, forwar
 offers them), and registers itself with Claude Code as an HTTP MCP server. A launchd
 agent keeps it running across logins.
 
+## What this is (vs. Hopper's built-in MCP)
+
+Hopper 6.0+ has a **built-in** MCP server, `HopperMCPServer`, that speaks MCP over
+**stdio** (newline-delimited JSON) and does all the real work — every tool
+(disassemble, decompile, xrefs, comments, …) is Hopper's own. A client can talk to
+it directly, no bridge involved:
+
+```
+Claude Code  --stdio/NDJSON-->  HopperMCPServer      # standard, built-in
+```
+
+This project does **not** replace that server or add any tools. It is a
+transport-translating proxy: one long-lived local process that is an MCP **server**
+to Claude (over HTTP) and an MCP **client** to Hopper (over stdio), forwarding
+`tools/list` / `tools/call` between the two (the HTTP diagram at the top).
+
+So the only differences from the built-in Hopper MCP are **transport** and **process
+ownership** — the tools you get are identical:
+
+| | Built-in Hopper MCP (direct) | Through this bridge |
+|---|------------------------------|---------------------|
+| Tools | Hopper's own | the same, forwarded unchanged |
+| Transport to the client | stdio / NDJSON | streamable HTTP |
+| Who launches Hopper | the client, per instance | the bridge, once |
+| Lifetime / scope | while the client runs | always-on (launchd), shared across projects |
+
+Why bother: Hopper's bundled server does not behave like a normal framed stdio MCP
+server in every client setup (it is a GUI app, and the stdio channel can misframe,
+buffer, or interleave notifications). The bridge keeps that stdio messiness in one
+place and hands the client a plain HTTP endpoint it handles cleanly. If direct stdio
+already works for you, you do not need the bridge — see below.
+
 ## When you actually need this
 
 Claude Code talks to stdio MCP servers natively, so if Hopper's stdio server works
