@@ -1,174 +1,107 @@
 # hopper-claude-mcp-http-bridge
 
-Expose Hopper Disassembler's MCP server to Claude Code over streamable HTTP.
+Put Hopper's built-in MCP server behind a local **HTTP** endpoint for Claude Code.
 
-```
-Claude Code  --streamable HTTP-->  this bridge  --stdio/NDJSON-->  HopperMCPServer
-```
+## The problem
 
-Hopper ships an MCP server (`HopperMCPServer`) that speaks a newline-delimited
-JSON protocol over stdio. This bridge runs a small local HTTP MCP server, forwards
-`tools/list`/`tools/call` (and, transparently, `prompts`/`resources` when Hopper
-offers them), and registers itself with Claude Code as an HTTP MCP server. A launchd
-agent keeps it running across logins.
+Hopper 6+ has a built-in MCP server, but it only speaks **stdio**, and that channel
+is flaky to drive directly. Why:
 
-## What this is (vs. Hopper's built-in MCP)
+- **Interleaved notifications.** Hopper writes more than replies to stdout (log /
+  progress notifications). A client that reads "one line = the response" grabs a
+  notification instead and desyncs.
+- **It's a GUI app, not a headless server.** The MCP server lazily launches the
+  Hopper GUI on the first call, and has had crashes (e.g. when the window is
+  minimized) and slow cold starts — the pipe doesn't behave like a normal daemon's.
+- **Long calls.** Decompiling / analyzing a big binary easily exceeds the client's
+  default stdio timeout (~60s), so the client kills the call.
 
-Hopper 6.0+ has a **built-in** MCP server, `HopperMCPServer`, that speaks MCP over
-**stdio** (newline-delimited JSON) and does all the real work — every tool
-(disassemble, decompile, xrefs, comments, …) is Hopper's own. A client can talk to
-it directly, no bridge involved:
+Each client also spawns its **own** Hopper.
 
-```
-Claude Code  --stdio/NDJSON-->  HopperMCPServer      # standard, built-in
-```
-
-This project does **not** replace that server or add any tools. It is a
-transport-translating proxy: one long-lived local process that is an MCP **server**
-to Claude (over HTTP) and an MCP **client** to Hopper (over stdio), forwarding
-`tools/list` / `tools/call` between the two (the HTTP diagram at the top).
-
-So the only differences from the built-in Hopper MCP are **transport** and **process
-ownership** — the tools you get are identical:
-
-| | Built-in Hopper MCP (direct) | Through this bridge |
-|---|------------------------------|---------------------|
-| Tools | Hopper's own | the same, forwarded unchanged |
-| Transport to the client | stdio / NDJSON | streamable HTTP |
-| Who launches Hopper | the client, per instance | the bridge, once |
-| Lifetime / scope | while the client runs | always-on (launchd), shared across projects |
-
-Why bother: Hopper's bundled server does not behave like a normal framed stdio MCP
-server in every client setup (it is a GUI app, and the stdio channel can misframe,
-buffer, or interleave notifications). The bridge keeps that stdio messiness in one
-place and hands the client a plain HTTP endpoint it handles cleanly. If direct stdio
-already works for you, you do not need the bridge — see below.
-
-## When you actually need this
-
-Claude Code talks to stdio MCP servers natively, so if Hopper's stdio server works
-directly for you, the simplest setup is no bridge at all:
-
-```bash
-claude mcp add hopper -- "/Applications/Hopper Disassembler.app/Contents/MacOS/HopperMCPServer"
+```mermaid
+flowchart LR
+    A["Claude Code · project A"] -.->|"stdio · ⚠️ flaky"| HA["HopperMCPServer"]
+    B["Claude Code · project B"] -.->|"stdio · ⚠️ flaky"| HB["HopperMCPServer"]
 ```
 
-Use this bridge when the stdio transport misbehaves in your setup and you want a
-plain HTTP endpoint instead, or when you want the server managed by launchd and
-shared across projects.
+## The fix
+
+One always-on local proxy: clients talk clean **HTTP**, the bridge owns the messy
+stdio side and a **single shared** Hopper.
+
+```mermaid
+flowchart LR
+    A["Claude Code · project A"] ==>|"HTTP ✓"| G["hopper-mcp-bridge<br/>launchd · always-on"]
+    B["Claude Code · project B"] ==>|"HTTP ✓"| G
+    G -->|"stdio · quirks handled here"| H["one HopperMCPServer"]
+```
+
+- **Same tools** — every tool stays Hopper's own, forwarded unchanged (`tools/list`,
+  `tools/call`, plus `prompts`/`resources` when Hopper offers them).
+- **Only two things change:** transport (stdio → HTTP) and process ownership
+  (per-client → one shared, launchd-managed).
+- Not a new MCP server — just a transport proxy in front of the official one.
 
 ## Requirements
 
-- macOS
-- **Hopper 6.0 or newer.** The bundled `HopperMCPServer` binary only ships with
-  Hopper 6+ — Hopper 4 and 5 have no MCP server and cannot be bridged. The bridge
-  auto-detects the binary across common bundle names/locations; override with
-  `--hopper-path` or `HOPPER_MCP_SERVER_PATH` if yours lives elsewhere.
-- Claude Code
-- Python 3.10+
+- macOS · Claude Code · Python 3.10+
+- **Hopper 6.0+** — the `HopperMCPServer` binary ships only with 6+ (4/5 have none).
+  Auto-detected; override with `--hopper-path`.
 
 ## Install
 
 ```bash
 cd hopper-mcp-bridge
-python3.11 -m venv .venv
-source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e .
-hopper-claude-mcp-http-bridge install
+hopper-claude-mcp-http-bridge install     # run with Claude Code closed, then restart it
 ```
-
-Then restart Claude Code so it re-reads its config.
 
 `install` does two things:
 
-1. Adds this block to `~/.claude.json` under `mcpServers` (atomically, under an
-   advisory lock, leaving the rest of the file untouched):
+- adds `hopper` to `~/.claude.json` → `{ "type": "http", "url": ".../mcp/", "timeout": 300000 }`
+- writes + loads a launchd agent (auto-starts on login)
 
-   ```json
-   "hopper": {
-     "type": "http",
-     "url": "http://127.0.0.1:8765/mcp/",
-     "timeout": 300000
-   }
-   ```
+Timeout is **300s** (`--tool-timeout-sec`) because RE calls blow past Claude's ~60s
+default. If your build ignores the per-server `timeout`, set `MCP_TOOL_TIMEOUT` in
+`~/.claude/settings.json` instead.
 
-   The `timeout` (milliseconds) matters: Claude Code's default per-tool timeout is
-   ~60s, and reverse-engineering calls (decompiling a large function, analyzing a big
-   Mach-O) routinely exceed that. Tune it with `--tool-timeout-sec` (default 300).
+## Don't need the bridge?
 
-2. Writes and loads a launchd agent at
-   `~/Library/LaunchAgents/io.github.hopper-claude-mcp-http-bridge.plist`. The agent
-   bakes in the resolved Hopper path and the tool timeout.
+Claude Code speaks stdio natively — if direct stdio already works for you, skip all this:
 
-Because Claude Code also writes to `~/.claude.json`, run `install` while Claude
-Code is closed, then start it again. (The advisory lock only guards against other
-bridge processes — Claude Code itself does not take it.)
-
-If Claude Code ignores the per-server `timeout` in your build (there are open bugs
-around HTTP/SSE timeout handling), set a global fallback in `~/.claude/settings.json`:
-
-```json
-{ "env": { "MCP_TOOL_TIMEOUT": "300000" } }
+```bash
+claude mcp add hopper -- "/Applications/Hopper Disassembler.app/Contents/MacOS/HopperMCPServer"
 ```
 
-Note: the default server name is `hopper`. If you already have a `hopper` entry,
-`install` replaces it. Use `--server-name hopper-bridge` to keep both.
+## Commands
+
+| command | what it does |
+|---|---|
+| `serve` | run the bridge in the foreground |
+| `install` / `uninstall` | register / remove (launchd agent + config entry) |
+| `status` | url, timeout, `bridge_health`, `backend` |
+
+Options: `--port`, `--server-name`, `--tool-timeout-sec`, `--hopper-path`, `--no-load-agent`.
 
 ## Verify
 
 ```bash
-curl http://127.0.0.1:8765/healthz          # -> ok           (bridge process alive)
-curl http://127.0.0.1:8765/readyz           # -> JSON: backend state + Hopper path
-hopper-claude-mcp-http-bridge status        # url, timeout, bridge_health, backend
-claude mcp list                             # hopper should be listed as http
+curl http://127.0.0.1:8765/healthz     # -> ok    (bridge process up)
+curl http://127.0.0.1:8765/readyz      # -> JSON  (backend state + Hopper path)
+hopper-claude-mcp-http-bridge status
 ```
 
-`status` reports `bridge_health` (is the HTTP bridge up) separately from `backend`
-(is the Hopper subprocess running / is the binary present). A `backend:
-missing-hopper-binary` line means you need Hopper 6+.
-
-## Commands
-
-```bash
-hopper-claude-mcp-http-bridge serve       # run the bridge in the foreground
-hopper-claude-mcp-http-bridge install     # register + launchd agent
-hopper-claude-mcp-http-bridge uninstall   # remove agent, unregister
-hopper-claude-mcp-http-bridge status      # url + agent + health
-```
-
-Useful options: `--port 9876`, `--server-name hopper-bridge`, `--tool-timeout-sec 600`,
-`--hopper-path /path/to/HopperMCPServer`, `--no-load-agent` (write files only),
-`uninstall --keep-config` (drop the agent, keep the entry).
-
-## Logs
-
-```
-~/.claude/logs/hopper-mcp-http-bridge.log            # bridge + captured Hopper stderr
-~/.claude/logs/hopper-mcp-http-bridge.log.stdout.log
-~/.claude/logs/hopper-mcp-http-bridge.log.stderr.log
-```
+`status` shows `bridge_health` (HTTP up) separately from `backend` (Hopper running /
+binary present). `backend: missing-hopper-binary` → you need Hopper 6+.
 
 ## Notes
 
-- The bridge forwards Hopper's tools, and forwards prompts/resources transparently
-  when Hopper is already running and implements them (it will not start Hopper just
-  to answer a startup `prompts/list`).
-- A dedicated reader thread parses Hopper's output, so a request waits for its own
-  id and skips interleaved notifications instead of mistaking one for the response.
-  Each call is bounded by the tool timeout; a wedged Hopper call is terminated and
-  restarted rather than pinning the bridge.
-
-### On the `mcp` dependency pin
-
-`mcp` is pinned to `>=1.27,<2` on purpose. This bridge is built on the **low-level
-`mcp.server.lowlevel.Server` API** and its decorators (`@server.list_tools()`,
-`@server.call_tool()`, `@server.list_prompts()`, `@server.list_resources()`).
-
-That API changed in **mcp 2.0**: those decorators were removed/reworked, so an
-unpinned `mcp>=1.27.0` install now resolves to 2.x and the bridge fails at startup
-with `AttributeError: 'Server' object has no attribute 'list_prompts'`. The upper
-bound keeps installs on the 1.x line the code targets. Moving to mcp 2.x is a
-separate migration (adapt the low-level handlers to the new API), not a version bump.
+- A reader thread matches each response by id and skips interleaved notifications;
+  every call is bounded by the timeout (a wedged call is killed and restarted).
+- `mcp` is pinned `>=1.27,<2`: the low-level `Server` API changed in mcp 2.0, so an
+  unpinned install breaks the bridge at startup.
+- Logs: `~/.claude/logs/hopper-mcp-http-bridge.log` (+ `.stdout.log`, `.stderr.log`).
 
 ## License
 
