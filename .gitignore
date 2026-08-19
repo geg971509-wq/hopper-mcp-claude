@@ -1,0 +1,24 @@
+# never commit binaries, dumps, or generated databases
+*.ipa
+*.zip
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.arm64
+*.log
+extracted/
+dbs/
+*.app/
+.DS_Store
+
+# python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/

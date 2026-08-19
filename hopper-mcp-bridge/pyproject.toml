@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hopper-claude-mcp-http-bridge"
+version = "0.1.0"
+description = "Expose Hopper's MCP server to Claude Code via streamable HTTP."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Mikita Laptsionak" }
+]
+dependencies = [
+  "anyio>=4.5",
+  "mcp>=1.27.0",
+  "starlette>=0.37",
+  "uvicorn>=0.31.1",
+]
+
+[project.scripts]
+hopper-claude-mcp-http-bridge = "hopper_claude_mcp_bridge.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
