@@ -52,13 +52,24 @@ claude mcp add hopper -- "/Applications/Hopper Disassembler.app/Contents/MacOS/H
 The local Claude plugin provides the same direct stdio server without a wrapper:
 
 ```bash
-claude plugin marketplace add /absolute/path/to/hopper-mcp-claude
+claude plugin marketplace add geg971509-wq/hopper-mcp-claude
 claude plugin install hopper-mcp@hopper-local
+```
+
+To uninstall the plugin:
+
+```bash
 claude plugin uninstall hopper-mcp@hopper-local
 ```
 
-The direct stdio plugin is separate from the existing HTTP bridge setup above; remote
-marketplace publication is not done.
+To remove the marketplace registration as well:
+
+```bash
+claude plugin marketplace remove hopper-local
+```
+
+The direct stdio plugin is separate from the existing HTTP bridge setup above; it
+launches Hopper's built-in `HopperMCPServer` directly.
 
 ## ✅ Requirements
 
