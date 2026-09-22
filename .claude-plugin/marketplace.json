@@ -1,0 +1,12 @@
+{
+  "name": "hopper-local",
+  "owner": {
+    "name": "Local"
+  },
+  "plugins": [
+    {
+      "name": "hopper-mcp",
+      "source": "./"
+    }
+  ]
+}

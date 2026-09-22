@@ -43,16 +43,27 @@ hopper-claude-mcp-http-bridge install     # then restart Claude Code
 
 Full docs → **[hopper-mcp-bridge/README.md](hopper-mcp-bridge/README.md)**.
 
-Already happy with raw stdio? Skip the bridge entirely:
+Already happy with raw stdio? Skip the bridge entirely. Hopper 6.0+ is required:
 
 ```bash
 claude mcp add hopper -- "/Applications/Hopper Disassembler.app/Contents/MacOS/HopperMCPServer"
 ```
 
+The local Claude plugin provides the same direct stdio server without a wrapper:
+
+```bash
+claude plugin marketplace add /absolute/path/to/hopper-mcp-claude
+claude plugin install hopper-mcp@hopper-local
+claude plugin uninstall hopper-mcp@hopper-local
+```
+
+The direct stdio plugin is separate from the existing HTTP bridge setup above; remote
+marketplace publication is not done.
+
 ## ✅ Requirements
 
 - **macOS** · **Claude Code** · **Python 3.10+**
-- **Hopper 6.0+** — ships the `HopperMCPServer` binary (for the bridge)
+- **Hopper 6.0+** — ships the `HopperMCPServer` binary (for the bridge and direct plugin)
 - **IDA Pro** with `idat` — only for `references/open_ipa.sh`
 
 ## 💡 Why the bridge?
