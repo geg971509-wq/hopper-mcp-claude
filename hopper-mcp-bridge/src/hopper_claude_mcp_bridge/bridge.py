@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Any
 import anyio
 import mcp.types as types
 import uvicorn
+from jsonschema import ValidationError, validate
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.applications import Starlette
@@ -196,20 +198,53 @@ class HopperBackend:
     def list_tools(self) -> list[types.Tool]:
         with self.lock:
             self._ensure_proc_locked()
-            if self.tools_cache is None:
-                response = self._request_locked("tools/list", {})
-                if "error" in response:
-                    error = response["error"]
-                    raise RuntimeError(
-                        f"Hopper tools/list error {error.get('code')}: "
-                        f"{error.get('message')}"
-                    )
-                self.tools_cache = [
-                    types.Tool.model_validate(tool)
-                    for tool in response["result"]["tools"]
+            return self._list_tools_locked()
+
+    def _list_tools_locked(self) -> list[types.Tool]:
+        if self.tools_cache is None:
+            response = self._request_locked("tools/list", {})
+            if "error" in response:
+                error = response["error"]
+                raise RuntimeError(
+                    f"Hopper tools/list error {error.get('code')}: "
+                    f"{error.get('message')}"
+                )
+            self.tools_cache = [
+                types.Tool.model_validate(tool)
+                for tool in response["result"]["tools"]
+            ]
+            self.logger.log(f"cached {len(self.tools_cache)} Hopper tools")
+        tools = deepcopy(self.tools_cache)
+        for tool in tools:
+            schema = tool.inputSchema
+            properties = schema.get("properties", {})
+            notes = []
+            if "document" in properties:
+                properties["document"].update(type="string", pattern=r"\S")
+                schema["required"] = [
+                    key for key in schema.get("required", []) if key != "document"
                 ]
-                self.logger.log(f"cached {len(self.tools_cache)} Hopper tools")
-            return list(self.tools_cache)
+                notes.append(
+                    "Omit document to resolve current_document at call time; "
+                    "an explicit document must be a nonblank string and is never replaced."
+                )
+            if "procedure" in properties and "address" not in properties:
+                properties["address"] = deepcopy(properties["procedure"])
+                properties["address"]["description"] = "Alias for procedure."
+                if "procedure" in schema.get("required", []):
+                    schema["required"].remove("procedure")
+                    schema.setdefault("allOf", []).append(
+                        {"anyOf": [{"required": ["procedure"]}, {"required": ["address"]}]}
+                    )
+                notes.append("address is an alias for procedure; if both are supplied they must match.")
+            schema["additionalProperties"] = False
+            notes.append(
+                "Accepted keys: " + (", ".join(sorted(properties)) or "(none)")
+                + ". Unknown keys are rejected; use search_procedures to narrow procedure listings "
+                "instead of an unsupported limit."
+            )
+            tool.description = " ".join([tool.description or "", *notes]).strip()
+        return tools
 
     def list_prompts(self) -> list[types.Prompt]:
         return self._list_optional("prompts/list", "prompts", types.Prompt)
@@ -227,8 +262,56 @@ class HopperBackend:
     ) -> types.CallToolResult:
         with self.lock:
             self._ensure_proc_locked()
+            arguments = dict(arguments) if arguments is not None else {}
+            tool = next((tool for tool in self._list_tools_locked() if tool.name == name), None)
+            try:
+                if tool is None:
+                    raise ValueError(f"Unknown Hopper tool: {name}. Refresh tools/list.")
+                properties = tool.inputSchema.get("properties", {})
+                unknown = arguments.keys() - properties.keys()
+                if unknown:
+                    raise ValueError(
+                        f"Unknown arguments: {', '.join(sorted(unknown))}. "
+                        f"Accepted keys: {', '.join(sorted(properties)) or '(none)'}. "
+                        "Use search_procedures to narrow procedure listings instead of an unsupported limit."
+                    )
+                if "document" in properties and "document" in arguments:
+                    document = arguments["document"]
+                    if not isinstance(document, str) or not document.strip():
+                        raise ValueError("Supply a nonblank document name, or omit document to use current_document.")
+                validate(arguments, tool.inputSchema)
+                raw_tool = next((tool for tool in self.tools_cache or [] if tool.name == name), None)
+                if raw_tool is None:
+                    raise ValueError("Hopper tools changed during validation; refresh tools/list and retry.")
+                raw_properties = raw_tool.inputSchema.get("properties", {})
+                if "procedure" in raw_properties and "address" not in raw_properties and "address" in arguments:
+                    address = arguments.pop("address")
+                    if "procedure" in arguments and arguments["procedure"] != address:
+                        raise ValueError("address and procedure must match; supply only one to select a procedure.")
+                    arguments["procedure"] = address
+                if "document" in properties and "document" not in arguments:
+                    hint = "Cannot resolve current_document; supply an explicit document name (see list_documents)."
+                    try:
+                        current = self._request_locked(
+                            "tools/call", {"name": "current_document", "arguments": {}}
+                        )
+                        if "error" in current:
+                            raise ValueError(hint)
+                        result = types.CallToolResult.model_validate(current.get("result", {}))
+                    except Exception as exc:
+                        raise ValueError(hint) from exc
+                    if result.isError or len(result.content) != 1:
+                        raise ValueError(hint)
+                    content = result.content[0]
+                    if not isinstance(content, types.TextContent) or not content.text.strip():
+                        raise ValueError(hint)
+                    arguments["document"] = content.text
+            except (ValueError, ValidationError) as exc:
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=str(exc))], isError=True
+                )
             response = self._request_locked(
-                "tools/call", {"name": name, "arguments": arguments or {}}
+                "tools/call", {"name": name, "arguments": arguments}
             )
 
             if "error" in response:
